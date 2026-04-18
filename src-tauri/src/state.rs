@@ -217,6 +217,52 @@ impl AppState {
         }
     }
 
+    /// 下載端斷線：清理佇列、釋放中繼、重新排程
+    pub async fn disconnect_client(&self, client_id: &str) {
+        // 從所有佇列移除此端
+        {
+            let mut queues = self.queues.write().await;
+            for queue in queues.values_mut() {
+                queue.items.retain(|item| item.client_id != client_id);
+            }
+        }
+
+        // 清理此端作為中繼來源的傳輸通道，釋放中繼目標端回佇列
+        let mut relay_targets: Vec<(String, String)> = Vec::new();
+        {
+            let channels = self.channels.read().await;
+            for channel in channels.values() {
+                if channel.source == client_id && channel.channel_type == ChannelType::Webrtc {
+                    relay_targets.push((channel.file_id.clone(), channel.target.clone()));
+                }
+            }
+        }
+        // 將被中繼的目標端標記為失敗（回到排隊）
+        for (file_id, target_id) in &relay_targets {
+            let mut queues = self.queues.write().await;
+            if let Some(queue) = queues.get_mut(file_id.as_str()) {
+                if let Some(item) = queue.items.iter_mut().find(|i| i.client_id == *target_id) {
+                    item.state = DownloadState::Queued;
+                }
+            }
+        }
+
+        // 清理相關傳輸通道
+        {
+            let mut channels = self.channels.write().await;
+            channels.retain(|_, ch| ch.source != client_id && ch.target != client_id);
+        }
+
+        // 移除下載端，並釋放任何被此端中繼鎖定的 relay 狀態
+        {
+            let mut clients = self.clients.write().await;
+            clients.remove(client_id);
+        }
+
+        // 重新排程
+        self.dispatch_all().await;
+    }
+
     /// 發送 SSE 事件
     pub fn broadcast(&self, event: SseEvent) {
         let _ = self.sse_tx.send(event);

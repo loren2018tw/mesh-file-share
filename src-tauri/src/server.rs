@@ -11,6 +11,8 @@ use axum::{
 use futures::stream::Stream;
 use serde::Deserialize;
 use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
@@ -178,7 +180,47 @@ async fn sse_handler(
         Err(_) => None,
     });
 
-    Sse::new(initial.chain(events)).keep_alive(axum::response::sse::KeepAlive::default())
+    let inner_stream = initial.chain(events);
+
+    // 包裝 stream 以偵測客戶端斷線（stream drop 時清理）
+    let cleanup_stream = ClientStream {
+        inner: Box::pin(inner_stream),
+        state: state.clone(),
+        client_id: client_id.clone(),
+        cleaned_up: false,
+    };
+
+    Sse::new(cleanup_stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+/// 包裝 SSE stream，當 stream 被 drop（客戶端斷線）時執行清理
+struct ClientStream<S> {
+    inner: Pin<Box<S>>,
+    state: AppState,
+    client_id: String,
+    cleaned_up: bool,
+}
+
+impl<S: Stream<Item = Result<Event, Infallible>>> Stream for ClientStream<S> {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl<S> Drop for ClientStream<S> {
+    fn drop(&mut self) {
+        if !self.cleaned_up {
+            self.cleaned_up = true;
+            let state = self.state.clone();
+            let client_id = self.client_id.clone();
+            println!("下載端斷線: {}", client_id);
+            tokio::spawn(async move {
+                state.disconnect_client(&client_id).await;
+            });
+        }
+    }
 }
 
 /// POST /api/signaling/offer — WebRTC SDP offer 轉發

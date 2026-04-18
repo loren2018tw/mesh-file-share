@@ -367,6 +367,13 @@ class WebRTCManager {
 
     // 傳送結束標記（空訊息）
     dc.send(new ArrayBuffer(0));
+
+    // 等待 buffer 清空，確保結束標記送達
+    while (dc.bufferedAmount > 0) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    // 額外等待讓接收端處理結束標記
+    await new Promise((r) => setTimeout(r, 500));
   }
 
   /** 透過 DataChannel 接收檔案並寫入 OPFS */
@@ -380,6 +387,7 @@ class WebRTCManager {
       this.resolveFileName(fileId),
     );
     let received = 0;
+    let completed = false;
 
     return new Promise((resolve, reject) => {
       dc.binaryType = "arraybuffer";
@@ -388,6 +396,7 @@ class WebRTCManager {
         const data = e.data as ArrayBuffer;
         if (data.byteLength === 0) {
           // 結束標記
+          completed = true;
           await writer.close();
           resolve();
           return;
@@ -401,8 +410,12 @@ class WebRTCManager {
         }
       };
 
-      dc.onerror = () => reject(new Error("DataChannel error"));
-      dc.onclose = () => reject(new Error("DataChannel closed unexpectedly"));
+      dc.onerror = () => {
+        if (!completed) reject(new Error("DataChannel error"));
+      };
+      dc.onclose = () => {
+        if (!completed) reject(new Error("DataChannel closed unexpectedly"));
+      };
     });
   }
 
