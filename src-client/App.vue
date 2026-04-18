@@ -103,6 +103,13 @@ function connectSSE() {
     webrtcManager.init(
       clientId.value,
       handleRelayReceiveComplete,
+      (fileId) => {
+        // 分享傳送完成，切回「下載完成」
+        const existing = downloadStatuses.get(fileId);
+        if (existing && existing.state === "relaying") {
+          downloadStatuses.set(fileId, { ...existing, state: "completed" });
+        }
+      },
       (fileId, downloadedBytes) => {
         const existing = downloadStatuses.get(fileId);
         if (existing) {

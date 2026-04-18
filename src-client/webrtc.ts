@@ -3,11 +3,12 @@
 import type { RelayAssignEvent, SignalingMessage } from "../src-shared/types";
 import { fileStore } from "./fsaa";
 
-const CHUNK_SIZE = 64 * 1024; // 64KB
-const BACKPRESSURE_THRESHOLD = 1 * 1024 * 1024; // 1MB
+const CHUNK_SIZE = 256 * 1024; // 256KB
+const BACKPRESSURE_THRESHOLD = 8 * 1024 * 1024; // 8MB
 const CONNECTION_TIMEOUT = 30_000; // 30s
 
 type RelayReceiveCallback = (fileId: string) => Promise<void>;
+type SendCompleteCallback = (fileId: string) => void;
 type ProgressCallback = (fileId: string, downloadedBytes: number) => void;
 type FileNameResolver = (fileId: string) => string;
 
@@ -24,6 +25,7 @@ class WebRTCManager {
   private clientId: string = "";
   private connections: Map<string, PeerConnection> = new Map();
   private onReceiveComplete: RelayReceiveCallback = async () => {};
+  private onSendComplete: SendCompleteCallback = () => {};
   private onProgress: ProgressCallback = () => {};
   private resolveFileName: FileNameResolver = (id) => id;
   /** 信令處理佇列：確保同一連線的信令按序處理 */
@@ -34,11 +36,13 @@ class WebRTCManager {
   init(
     clientId: string,
     onReceiveComplete: RelayReceiveCallback,
+    onSendComplete: SendCompleteCallback,
     onProgress: ProgressCallback,
     resolveFileName: FileNameResolver,
   ) {
     this.clientId = clientId;
     this.onReceiveComplete = onReceiveComplete;
+    this.onSendComplete = onSendComplete;
     this.onProgress = onProgress;
     this.resolveFileName = resolveFileName;
   }
@@ -92,6 +96,7 @@ class WebRTCManager {
         await this.notifyTransferFailed(event.fileId, event.targetClientId);
       } finally {
         this.cleanup(peerKey);
+        this.onSendComplete(event.fileId);
       }
     };
 
@@ -344,7 +349,7 @@ class WebRTCManager {
         buffer = newBuf;
       }
 
-      // 從 buffer 分段傳送 64KB 區塊
+      // 從 buffer 分段傳送 256KB 區塊
       while (
         buffer.byteLength >= CHUNK_SIZE ||
         (done && buffer.byteLength > 0)
