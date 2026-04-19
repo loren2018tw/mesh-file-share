@@ -2,6 +2,7 @@
 import { ref, onMounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
+import QRCode from "qrcode";
 
 interface FileInfo {
   id: string;
@@ -27,6 +28,13 @@ const serverInfo = ref<ServerInfo | null>(null);
 const clients = ref<ClientInfo[]>([]);
 const appVersion = ref("");
 const isLoading = ref(false);
+const qrDialog = ref(false);
+const qrCodeDataUrl = ref("");
+const qrLoading = ref(false);
+const snackbar = ref(false);
+const snackbarText = ref("");
+
+const QR_CODE_SIZE = 1024;
 
 const fileHeaders = [
   { title: "檔名", key: "name" },
@@ -81,6 +89,61 @@ async function removeFile(id: string) {
   await loadFiles();
 }
 
+async function copyToClipboard(text: string, successMessage: string) {
+  if (!text) return;
+
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.left = "-9999px";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textarea);
+    }
+
+    snackbarText.value = successMessage;
+    snackbar.value = true;
+  } catch (err) {
+    console.error("複製失敗:", err);
+    snackbarText.value = "複製失敗，請手動複製網址";
+    snackbar.value = true;
+  }
+}
+
+async function copyShareUrl() {
+  await copyToClipboard(serverInfo.value?.url ?? "", "已複製分享網址");
+}
+
+async function showShareQrCode() {
+  const shareUrl = serverInfo.value?.url ?? "";
+  if (!shareUrl) return;
+
+  await copyToClipboard(shareUrl, "已複製分享網址，並開啟 QR Code");
+  qrDialog.value = true;
+  qrLoading.value = true;
+
+  try {
+    qrCodeDataUrl.value = await QRCode.toDataURL(shareUrl, {
+      width: QR_CODE_SIZE,
+      margin: 1,
+      errorCorrectionLevel: "M",
+    });
+  } catch (err) {
+    console.error("QR Code 產生失敗:", err);
+    qrCodeDataUrl.value = "";
+    snackbarText.value = "QR Code 產生失敗";
+    snackbar.value = true;
+  } finally {
+    qrLoading.value = false;
+  }
+}
+
 onMounted(async () => {
   appVersion.value = await getVersion();
   await loadServerInfo();
@@ -114,9 +177,22 @@ onMounted(async () => {
               <v-icon start>mdi-circle</v-icon>
               已啟動
             </v-chip>
-            <v-chip variant="outlined" class="mr-2">
+            <v-btn
+              variant="outlined"
+              class="mr-2"
+              size="small"
+              @click="copyShareUrl"
+            >
+              <v-icon start size="small">mdi-content-copy</v-icon>
               {{ serverInfo.url }}
-            </v-chip>
+            </v-btn>
+            <v-btn
+              icon="mdi-qrcode"
+              size="x-small"
+              variant="text"
+              class="mr-2"
+              @click="showShareQrCode"
+            />
             <v-chip variant="outlined">
               <v-icon start>mdi-account-multiple</v-icon>
               已連線：{{ clients.length }} 台
@@ -201,5 +277,79 @@ onMounted(async () => {
         </v-card>
       </v-container>
     </v-main>
+
+    <v-dialog v-model="qrDialog" persistent max-width="none" class="qr-dialog">
+      <v-card class="qr-dialog-card">
+        <v-card-title class="d-flex align-center">
+          <span>下載網址 QR Code</span>
+          <v-spacer />
+          <v-btn
+            icon="mdi-close"
+            variant="text"
+            size="small"
+            @click="qrDialog = false"
+          />
+        </v-card-title>
+        <v-card-text class="d-flex flex-column align-center qr-dialog-content">
+          <v-progress-circular
+            v-if="qrLoading"
+            indeterminate
+            size="48"
+            color="primary"
+            class="my-8"
+          />
+          <v-img
+            v-else-if="qrCodeDataUrl"
+            :src="qrCodeDataUrl"
+            class="qr-code-image"
+            aspect-ratio="1"
+            contain
+          />
+          <v-alert v-else type="error" variant="tonal" class="my-4">
+            無法產生 QR Code
+          </v-alert>
+          <div class="text-caption mt-4 qr-url-text">
+            {{ serverInfo?.url }}
+          </div>
+        </v-card-text>
+      </v-card>
+    </v-dialog>
+
+    <v-snackbar v-model="snackbar" timeout="2200" location="bottom right">
+      {{ snackbarText }}
+    </v-snackbar>
   </v-app>
 </template>
+
+<style scoped>
+.qr-dialog :deep(.v-overlay__content) {
+  width: min(96vw, 1080px);
+  max-height: 96vh;
+  margin: 0;
+}
+
+.qr-dialog-card {
+  max-height: 96vh;
+  overflow: hidden;
+}
+
+.qr-dialog-content {
+  height: calc(96vh - 64px);
+  overflow: hidden;
+  padding-top: 8px;
+}
+
+.qr-code-image {
+  width: min(88vw, calc(96vh - 180px));
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.qr-url-text {
+  width: 100%;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+</style>

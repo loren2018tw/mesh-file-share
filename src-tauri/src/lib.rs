@@ -4,11 +4,12 @@ mod server;
 mod state;
 
 use state::AppState;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Manager;
 
-fn resolve_client_dist_dir(app: &tauri::App) -> Option<String> {
+fn resolve_client_dist_dir(app: &tauri::App) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = vec![];
 
     // 開發模式常見路徑（工作目錄在專案根目錄）
@@ -36,7 +37,17 @@ fn resolve_client_dist_dir(app: &tauri::App) -> Option<String> {
     candidates
         .into_iter()
         .find(|dir| dir.join("client.html").exists())
-        .map(|dir| dir.to_string_lossy().to_string())
+}
+
+fn select_server_port(preferred_port: u16) -> u16 {
+    if TcpListener::bind(("0.0.0.0", preferred_port)).is_ok() {
+        return preferred_port;
+    }
+
+    TcpListener::bind(("0.0.0.0", 0))
+        .ok()
+        .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
+        .unwrap_or(preferred_port)
 }
 
 /// Tauri 管理的共享狀態
@@ -103,7 +114,14 @@ async fn list_clients(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let port: u16 = 8080;
+    let preferred_port: u16 = 8080;
+    let port = select_server_port(preferred_port);
+    if port != preferred_port {
+        eprintln!(
+            "預設連接埠 {} 已被占用，改用可用連接埠 {}",
+            preferred_port, port
+        );
+    }
     let app_state = AppState::new(port);
     let server_state = app_state.clone();
 

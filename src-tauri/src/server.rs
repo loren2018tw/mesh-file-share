@@ -11,6 +11,7 @@ use axum::{
 use futures::stream::Stream;
 use serde::Deserialize;
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio_stream::wrappers::BroadcastStream;
@@ -20,7 +21,7 @@ use tower_http::cors::CorsLayer;
 use crate::state::{AppState, SignalingMessage, SseEvent};
 
 /// 建立 Axum Router
-pub fn create_router(state: AppState, client_dist_dir: Option<String>) -> Router {
+pub fn create_router(state: AppState, client_dist_dir: Option<PathBuf>) -> Router {
     let api = Router::new()
         .route("/api/files", get(list_files))
         .route("/api/files/:id/download", get(download_file))
@@ -41,7 +42,7 @@ pub fn create_router(state: AppState, client_dist_dir: Option<String>) -> Router
 
     if let Some(dir) = client_dist_dir {
         // 提供下載端 SPA 靜態檔案
-        let index_path = format!("{}/client.html", dir);
+        let index_path = dir.join("client.html");
         let serve = tower_http::services::ServeDir::new(&dir)
             .fallback(tower_http::services::ServeFile::new(index_path));
         api.fallback_service(serve)
