@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Manager;
 
-fn resolve_client_dist_dir(app: &tauri::App) -> Option<String> {
+fn resolve_client_dist_dir(app: &tauri::App) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = vec![];
 
     // 開發模式常見路徑（工作目錄在專案根目錄）
@@ -36,7 +36,6 @@ fn resolve_client_dist_dir(app: &tauri::App) -> Option<String> {
     candidates
         .into_iter()
         .find(|dir| dir.join("client.html").exists())
-        .map(|dir| dir.to_string_lossy().to_string())
 }
 
 /// Tauri 管理的共享狀態
