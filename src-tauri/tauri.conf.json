@@ -23,6 +23,9 @@
   },
   "bundle": {
     "active": true,
+    "resources": [
+      "../dist-client"
+    ],
     "targets": [
       "deb",
       "nsis"

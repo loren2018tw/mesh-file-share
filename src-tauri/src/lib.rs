@@ -6,6 +6,38 @@ mod state;
 use state::AppState;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::Manager;
+
+fn resolve_client_dist_dir(app: &tauri::App) -> Option<String> {
+    let mut candidates: Vec<PathBuf> = vec![];
+
+    // 開發模式常見路徑（工作目錄在專案根目錄）
+    candidates.push(PathBuf::from("dist-client"));
+    candidates.push(PathBuf::from("../dist-client"));
+
+    // 打包後優先從 resource 目錄尋找
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("dist-client"));
+        candidates.push(resource_dir.join("_up_/dist-client"));
+    }
+
+    // 直接執行 release binary 時，嘗試由執行檔位置回推
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("dist-client"));
+            candidates.push(exe_dir.join("_up_/dist-client"));
+            candidates.push(exe_dir.join("../dist-client"));
+            candidates.push(exe_dir.join("../_up_/dist-client"));
+            candidates.push(exe_dir.join("../../dist-client"));
+            candidates.push(exe_dir.join("../../_up_/dist-client"));
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|dir| dir.join("client.html").exists())
+        .map(|dir| dir.to_string_lossy().to_string())
+}
 
 /// Tauri 管理的共享狀態
 struct TauriState {
@@ -88,19 +120,11 @@ pub fn run() {
             get_server_info,
             list_clients,
         ])
-        .setup(move |_app| {
+        .setup(move |app| {
             // 啟動 Axum HTTPS Server（自行簽署憑證）
             let state = server_state.clone();
+            let client_dir = resolve_client_dist_dir(app);
             tauri::async_runtime::spawn(async move {
-                // 嘗試尋找 dist-client 目錄
-                let client_dir = if std::path::Path::new("../dist-client").exists() {
-                    Some("../dist-client".to_string())
-                } else if std::path::Path::new("dist-client").exists() {
-                    Some("dist-client".to_string())
-                } else {
-                    None
-                };
-
                 let router = server::create_router(state, client_dir);
                 let addr = format!("0.0.0.0:{}", port);
 
