@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 
 interface FileInfo {
   id: string;
@@ -24,6 +25,7 @@ interface ClientInfo {
 const files = ref<FileInfo[]>([]);
 const serverInfo = ref<ServerInfo | null>(null);
 const clients = ref<ClientInfo[]>([]);
+const appVersion = ref("");
 const isLoading = ref(false);
 
 const fileHeaders = [
@@ -80,6 +82,7 @@ async function removeFile(id: string) {
 }
 
 onMounted(async () => {
+  appVersion.value = await getVersion();
   await loadServerInfo();
   await loadFiles();
   // 定時更新下載端清單
@@ -90,10 +93,12 @@ onMounted(async () => {
 <template>
   <v-app>
     <v-app-bar color="primary" density="compact">
-      <v-app-bar-title
-        >mesh-file-share 區域網路檔案分享 by
-        Loren(loren.tw@gmail.com)</v-app-bar-title
-      >
+      <v-app-bar-title>
+        <div>mesh-file-share 區域網路檔案分享</div>
+        <div class="text-caption" style="opacity: 0.8">
+          v{{ appVersion }} by Loren(loren.tw@gmail.com)
+        </div>
+      </v-app-bar-title>
     </v-app-bar>
 
     <v-main>

@@ -11,6 +11,10 @@ import type {
 import { fileStore } from "./fsaa";
 import { webrtcManager } from "./webrtc";
 
+// --- App version (injected by Vite at build time) ---
+declare const __APP_VERSION__: string;
+const appVersion = __APP_VERSION__;
+
 // --- State ---
 const files = ref<FileInfo[]>([]);
 const downloadStatuses = reactive<Map<string, DownloadStatus>>(new Map());
@@ -385,11 +389,13 @@ onUnmounted(() => {
 
 <template>
   <v-app>
-    <v-app-bar color="primary" density="compact">
-      <v-app-bar-title
-        >mesh-file-share 區域網路檔案分享 by
-        Loren(loren.tw@gmail.com)</v-app-bar-title
-      >
+    <v-app-bar color="primary" density="default">
+      <v-app-bar-title>
+        <div>mesh-file-share 區域網路檔案分享</div>
+        <div class="text-caption" style="opacity: 0.8">
+          v{{ appVersion }} by Loren(loren.tw@gmail.com)
+        </div>
+      </v-app-bar-title>
       <template #append>
         <v-chip
           :color="sseConnected ? 'success' : 'error'"
