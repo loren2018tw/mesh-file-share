@@ -3,6 +3,8 @@
 interface FileStoreWriter {
   write(chunk: Uint8Array): Promise<void>;
   close(): Promise<void>;
+  /** 擲棄序列中所有尚未 commit 的寫入，釋放 .crswap 檔案鎖定 */
+  abort(): Promise<void>;
 }
 
 class FileStoreManager {
@@ -78,6 +80,15 @@ class FileStoreManager {
       },
       async close() {
         await writable.close();
+      },
+      async abort() {
+        try {
+          await (writable as FileSystemWritableFileStream).abort();
+        } catch {
+          // 部分瀏覽器實作可能不支援 abort，忽略
+        }
+        // 堆积成功廣播 abort 後，清理則由 deleteFile 負責
+        writtenSizes.set(fileId, 0);
       },
     };
   }

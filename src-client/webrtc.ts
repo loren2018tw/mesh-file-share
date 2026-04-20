@@ -468,45 +468,82 @@ class WebRTCManager {
     await new Promise((r) => setTimeout(r, 500));
   }
 
-  /** 透過 DataChannel 接收檔案並寫入 OPFS */
+  /** 透過 DataChannel 接收檔案並寫入磁碟 */
   private async receiveFile(
     dc: RTCDataChannel,
     fileId: string,
     _fileSize: number,
   ): Promise<void> {
+    // 必須在 createWriter（async）之前設定 binaryType，
+    // 否則 await createWriter 期間到達的訊息會以 Blob 而非 ArrayBuffer 傳入
+    dc.binaryType = "arraybuffer";
+
     const writer = await fileStore.createWriter(
       fileId,
       this.resolveFileName(fileId),
     );
+
     let received = 0;
-    let completed = false;
+    let settled = false; // 確保 resolve/reject 只呼叫一次
 
-    return new Promise((resolve, reject) => {
-      dc.binaryType = "arraybuffer";
+    // 序列化寫入佇列：所有 write / close / abort 操作嚴格按順序執行
+    // 這是解決「end marker 在 pending write 完成前抵達」的核心修復
+    let writeQueue: Promise<void> = Promise.resolve();
 
-      dc.onmessage = async (e) => {
+    return new Promise<void>((resolve, reject) => {
+      /** 只呼叫一次 resolve 或 reject */
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        fn();
+      };
+
+      dc.onmessage = (e) => {
+        if (settled) return; // 已結束（含失敗），忽略後續訊息
         const data = e.data as ArrayBuffer;
+
         if (data.byteLength === 0) {
-          // 結束標記
-          completed = true;
-          await writer.close();
-          resolve();
-          return;
-        }
-        try {
-          await writer.write(new Uint8Array(data));
-          received += data.byteLength;
-          this.onProgress(fileId, received);
-        } catch (err) {
-          reject(err);
+          // 結束標記：排入佇列尾端，等所有 write 完成後才 close
+          writeQueue = writeQueue
+            .then(async () => {
+              await writer.close();
+              settle(() => resolve());
+            })
+            .catch(async (err) => {
+              // 前面某個 write 已失敗，中止並釋放 .crswap
+              await writer.abort();
+              await fileStore.deleteFile(fileId);
+              settle(() => reject(err));
+            });
+        } else {
+          // 資料區塊：排入佇列序列寫入
+          const chunk = new Uint8Array(data.slice(0)); // 複製以免 ArrayBuffer 被回收
+          writeQueue = writeQueue.then(async () => {
+            if (settled) return; // abort 已在進行中，略過此區塊
+            await writer.write(chunk);
+            received += chunk.byteLength;
+            this.onProgress(fileId, received);
+          });
         }
       };
 
       dc.onerror = () => {
-        if (!completed) reject(new Error("DataChannel error"));
+        if (settled) return;
+        // 排入佇列尾端，等先前寫入完成（或失敗）後再 abort
+        writeQueue = writeQueue.finally(async () => {
+          await writer.abort();
+          await fileStore.deleteFile(fileId);
+          settle(() => reject(new Error("DataChannel error")));
+        });
       };
+
       dc.onclose = () => {
-        if (!completed) reject(new Error("DataChannel closed unexpectedly"));
+        if (settled) return;
+        writeQueue = writeQueue.finally(async () => {
+          await writer.abort();
+          await fileStore.deleteFile(fileId);
+          settle(() => reject(new Error("DataChannel closed unexpectedly")));
+        });
       };
     });
   }
