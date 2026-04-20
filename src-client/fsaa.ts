@@ -41,6 +41,19 @@ class FileStoreManager {
   ): Promise<FileStoreWriter> {
     if (!this.dirHandle) throw new Error("尚未選擇下載資料夾");
 
+    // 若此 fileId 已有先前未清理的記錄（傳輸失敗重試），先刪除舊檔，避免產生 testfile_1G(1)(2)... 的重複檔
+    const existingName = this.fileNames.get(fileId);
+    if (existingName) {
+      try {
+        await this.dirHandle.removeEntry(existingName);
+      } catch {
+        // 舊檔不存在或無法刪除，忽略
+      }
+      this.fileHandles.delete(fileId);
+      this.fileNames.delete(fileId);
+      this.writtenSizes.delete(fileId);
+    }
+
     // 避免覆蓋同名檔案：若已存在則加上序號
     const actualName = await this.getUniqueFileName(fileName);
     this.fileNames.set(fileId, actualName);

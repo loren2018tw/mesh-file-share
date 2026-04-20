@@ -6,6 +6,8 @@ import { fileStore } from "./fsaa";
 const CHUNK_SIZE = 256 * 1024; // 256KB
 const BACKPRESSURE_THRESHOLD = 8 * 1024 * 1024; // 8MB
 const CONNECTION_TIMEOUT = 30_000; // 30s
+/** ICE disconnected 寬限期：此狀態為暫態，可自行恢復；超過此時間未恢復才視為失敗 */
+const ICE_DISCONNECT_GRACE_MS = 10_000;
 
 type RelayReceiveCallback = (fileId: string) => Promise<void>;
 type SendCompleteCallback = (fileId: string) => void;
@@ -19,6 +21,10 @@ interface PeerConnection {
   role: "sender" | "receiver";
   event: RelayAssignEvent;
   pendingCandidates: RTCIceCandidateInit[];
+  /** DataChannel 已開啟（傳輸已開始）；失敗時由 dc 回調處理，ICE handler 不重複通知 */
+  transferActive: boolean;
+  /** ICE disconnected 寬限計時器 ID */
+  disconnectTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 class WebRTCManager {
@@ -73,19 +79,24 @@ class WebRTCManager {
       role: "sender",
       event,
       pendingCandidates: [],
+      transferActive: false,
+      disconnectTimer: undefined,
     });
 
-    // 設定連線逾時
+    // 設定連線逾時（僅涵蓋 DataChannel 建立階段；開啟後由 ICE/dc 狀態管理）
     const timeout = setTimeout(() => {
+      const conn = this.connections.get(peerKey);
+      if (!conn || conn.transferActive) return; // 已開始傳輸，不由 timeout 處理
       console.error("WebRTC 連線逾時:", peerKey);
       this.cleanup(peerKey);
-      this.notifyTransferFailed(event.fileId, event.targetClientId);
-      // 將 UI 狀態從「分享中」切回「完成」
+      void this.notifyTransferFailed(event.fileId, event.targetClientId);
       this.onSendComplete(event.fileId);
     }, CONNECTION_TIMEOUT);
 
     dc.onopen = async () => {
       clearTimeout(timeout);
+      const conn = this.connections.get(peerKey);
+      if (conn) conn.transferActive = true;
       try {
         console.log("WebRTC DataChannel 已開啟，開始傳送:", peerKey);
         await this.sendFile(dc, event.fileId, event.fileSize);
@@ -126,16 +137,50 @@ class WebRTCManager {
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log("WebRTC ICE 狀態 (sender):", peerKey, pc.iceConnectionState);
-      if (
-        pc.iceConnectionState === "failed" ||
-        pc.iceConnectionState === "disconnected"
-      ) {
-        console.error("WebRTC ICE 失敗/斷線 (sender):", peerKey);
+      const state = pc.iceConnectionState;
+      console.log("WebRTC ICE 狀態 (sender):", peerKey, state);
+      const conn = this.connections.get(peerKey);
+      if (!conn) return;
+
+      if (state === "connected" || state === "completed") {
+        // 恢復連線：取消斷線寬限計時器
+        if (conn.disconnectTimer !== undefined) {
+          clearTimeout(conn.disconnectTimer);
+          conn.disconnectTimer = undefined;
+        }
+      } else if (state === "failed") {
+        if (conn.disconnectTimer !== undefined)
+          clearTimeout(conn.disconnectTimer);
         clearTimeout(timeout);
-        this.cleanup(peerKey);
-        this.notifyTransferFailed(event.fileId, event.targetClientId);
-        this.onSendComplete(event.fileId);
+        const wasActive = conn.transferActive;
+        this.cleanup(peerKey); // 關閉 dc → sendFile 拋例外 → dc.onopen catch 處理後續
+        if (!wasActive) {
+          // DataChannel 從未開啟，需手動通知（否則無人通知 server）
+          console.error("WebRTC ICE 失敗（傳輸未啟動）(sender):", peerKey);
+          void this.notifyTransferFailed(event.fileId, event.targetClientId);
+          this.onSendComplete(event.fileId);
+        } else {
+          console.error("WebRTC ICE 失敗（傳輸中）(sender):", peerKey);
+          // transferActive=true：dc close/error 會觸發 dc.onopen catch 處理
+        }
+      } else if (state === "disconnected") {
+        // disconnected 為暫態，可自行恢復；給 ICE_DISCONNECT_GRACE_MS 緩衝
+        if (conn.disconnectTimer !== undefined) return; // 已有計時器
+        conn.disconnectTimer = setTimeout(() => {
+          const current = this.connections.get(peerKey);
+          if (!current) return; // 已被其他路徑清理
+          const iceState = current.pc.iceConnectionState;
+          if (iceState === "connected" || iceState === "completed") return; // 已恢復
+          console.error("WebRTC ICE 斷線未恢復 (sender):", peerKey, iceState);
+          clearTimeout(timeout);
+          const wasActive = current.transferActive;
+          this.cleanup(peerKey);
+          if (!wasActive) {
+            void this.notifyTransferFailed(event.fileId, event.targetClientId);
+            this.onSendComplete(event.fileId);
+          }
+          // wasActive=true：cleanup 關閉 dc → backpressure 檢查 readyState 拋例外 → catch 處理
+        }, ICE_DISCONNECT_GRACE_MS);
       }
     };
 
@@ -179,19 +224,26 @@ class WebRTCManager {
       role: "receiver",
       event,
       pendingCandidates: [],
+      transferActive: false,
+      disconnectTimer: undefined,
     });
 
     const timeout = setTimeout(() => {
+      const conn = this.connections.get(peerKey);
+      if (!conn || conn.transferActive) return;
       console.error("WebRTC 接收端連線逾時:", peerKey);
       this.cleanup(peerKey);
-      this.notifyTransferFailed(event.fileId, event.targetClientId);
+      void this.notifyTransferFailed(event.fileId, event.targetClientId);
     }, CONNECTION_TIMEOUT);
 
     pc.ondatachannel = async (e) => {
       clearTimeout(timeout);
-      const dc = e.channel;
       const conn = this.connections.get(peerKey);
-      if (conn) conn.dc = dc;
+      if (conn) {
+        conn.transferActive = true;
+        conn.dc = e.channel;
+      }
+      const dc = e.channel;
 
       try {
         console.log("WebRTC DataChannel 已接收，開始接收檔案:", peerKey);
@@ -220,19 +272,45 @@ class WebRTCManager {
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log(
-        "WebRTC ICE 狀態 (receiver):",
-        peerKey,
-        pc.iceConnectionState,
-      );
-      if (
-        pc.iceConnectionState === "failed" ||
-        pc.iceConnectionState === "disconnected"
-      ) {
-        console.error("WebRTC ICE 失敗/斷線 (receiver):", peerKey);
+      const state = pc.iceConnectionState;
+      console.log("WebRTC ICE 狀態 (receiver):", peerKey, state);
+      const conn = this.connections.get(peerKey);
+      if (!conn) return;
+
+      if (state === "connected" || state === "completed") {
+        if (conn.disconnectTimer !== undefined) {
+          clearTimeout(conn.disconnectTimer);
+          conn.disconnectTimer = undefined;
+        }
+      } else if (state === "failed") {
+        if (conn.disconnectTimer !== undefined)
+          clearTimeout(conn.disconnectTimer);
         clearTimeout(timeout);
+        const wasActive = conn.transferActive;
         this.cleanup(peerKey);
-        this.notifyTransferFailed(event.fileId, event.targetClientId);
+        if (!wasActive) {
+          console.error("WebRTC ICE 失敗（傳輸未啟動）(receiver):", peerKey);
+          void this.notifyTransferFailed(event.fileId, event.targetClientId);
+        } else {
+          console.error("WebRTC ICE 失敗（傳輸中）(receiver):", peerKey);
+          // transferActive=true：cleanup 關閉 dc → receiveFile 的 dc.onclose 拋例外 → catch 處理
+        }
+      } else if (state === "disconnected") {
+        if (conn.disconnectTimer !== undefined) return;
+        conn.disconnectTimer = setTimeout(() => {
+          const current = this.connections.get(peerKey);
+          if (!current) return;
+          const iceState = current.pc.iceConnectionState;
+          if (iceState === "connected" || iceState === "completed") return;
+          console.error("WebRTC ICE 斷線未恢復 (receiver):", peerKey, iceState);
+          clearTimeout(timeout);
+          const wasActive = current.transferActive;
+          this.cleanup(peerKey);
+          if (!wasActive) {
+            void this.notifyTransferFailed(event.fileId, event.targetClientId);
+          }
+          // wasActive=true：cleanup 關閉 dc → dc.onclose → receiveFile reject → catch 處理
+        }, ICE_DISCONNECT_GRACE_MS);
       }
     };
 
@@ -360,10 +438,14 @@ class WebRTCManager {
         const chunk = buffer.slice(0, Math.min(CHUNK_SIZE, buffer.byteLength));
         buffer = buffer.slice(chunk.byteLength);
 
-        // 背壓控制
+        // 背壓控制：若 DataChannel 已關閉（ICE 失敗/斷線後被 cleanup 關閉）則立即中止傳輸
         while (dc.bufferedAmount > BACKPRESSURE_THRESHOLD) {
+          if (dc.readyState !== "open")
+            throw new Error("DataChannel 已關閉（背壓等待中）");
           await new Promise((r) => setTimeout(r, 10));
         }
+        if (dc.readyState !== "open")
+          throw new Error("DataChannel 已關閉（傳送前檢查）");
 
         dc.send(chunk);
 
@@ -378,6 +460,8 @@ class WebRTCManager {
 
     // 等待 buffer 清空，確保結束標記送達
     while (dc.bufferedAmount > 0) {
+      if (dc.readyState !== "open")
+        throw new Error("DataChannel 已關閉（傳送完成等待中）");
       await new Promise((r) => setTimeout(r, 10));
     }
     // 額外等待讓接收端處理結束標記
@@ -465,6 +549,11 @@ class WebRTCManager {
   private cleanup(peerKey: string) {
     const conn = this.connections.get(peerKey);
     if (conn) {
+      // 取消斷線寬限計時器，避免 cleanup 後計時器觸發殘留邏輯
+      if (conn.disconnectTimer !== undefined) {
+        clearTimeout(conn.disconnectTimer);
+        conn.disconnectTimer = undefined;
+      }
       conn.dc?.close();
       conn.pc.close();
       this.connections.delete(peerKey);

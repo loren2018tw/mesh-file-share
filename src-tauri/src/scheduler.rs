@@ -4,6 +4,10 @@ use crate::state::{
 };
 use uuid::Uuid;
 
+/// 同時進行中的 WebRTC 傳輸通道上限（跨所有檔案）
+/// 控制瀏覽器同時開啟的 PeerConnection 數量，避免大檔案並發傳輸造成記憶體壓力及 Chrome 崩潰
+const MAX_CONCURRENT_WEBRTC: usize = 4;
+
 impl AppState {
     /// 下載端請求下載某檔案：加入排程，然後觸發排程
     pub async fn request_download(&self, file_id: &str, client_id: &str) -> Option<ScheduleEvent> {
@@ -215,7 +219,13 @@ impl AppState {
             .unwrap(),
         });
 
-        self.dispatch_all().await;
+        // 延遲 2 秒後再 dispatch：避免失敗後立即重試造成連線風暴
+        // 同時讓 ICE 寬限計時器（10s）有充分時間先嘗試恢復，再由 server 重排
+        let state_clone = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            state_clone.dispatch_all().await;
+        });
     }
 
     /// 全域排程：遍歷所有檔案的佇列，分配 HTTP 及 WebRTC 傳輸
@@ -302,6 +312,21 @@ impl AppState {
             .collect();
 
         if !remaining.is_empty() {
+            // 全域 WebRTC 並行上限：計算目前已在使用的通道數（跨所有檔案）
+            let webrtc_slots: usize = {
+                let channels = self.channels.read().await;
+                let active = channels
+                    .values()
+                    .filter(|ch| ch.channel_type == ChannelType::Webrtc)
+                    .count();
+                MAX_CONCURRENT_WEBRTC.saturating_sub(active)
+            };
+
+            if webrtc_slots == 0 {
+                // 已達上限，本輪不分配新的 WebRTC 傳輸；等現有傳輸完成後 dispatch 會再觸發
+                return;
+            }
+
             // 找出可用中繼端：已完成此檔案、目前未中繼
             let clients = self.clients.read().await;
             let mut available_relays: Vec<String> = clients
@@ -311,7 +336,11 @@ impl AppState {
                 .collect();
             drop(clients);
 
+            let mut slots_used = 0usize;
             for target_id in remaining {
+                if slots_used >= webrtc_slots {
+                    break; // 本次 dispatch 已用完可用 slot
+                }
                 // 取得此目標端的失敗中繼清單，跳過曾失敗的配對
                 let failed_relays: Vec<String> = queue
                     .items
@@ -370,6 +399,7 @@ impl AppState {
                     });
 
                     assigned.push(target_id);
+                    slots_used += 1;
                 } else {
                     // 所有可用中繼端皆曾失敗於此目標端 → 清除失敗記錄讓下次重新嘗試
                     // （避免永久卡住；若網路問題已恢復，下一輪 dispatch 可再試）
