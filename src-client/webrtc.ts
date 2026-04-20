@@ -484,10 +484,13 @@ class WebRTCManager {
     );
 
     let received = 0;
-    let settled = false; // 確保 resolve/reject 只呼叫一次
+    let settled = false;
+    /** 是否已收到傳送端的結束標記（end marker）
+     * DataChannel 在傳送端送完後會「正常」close；此旗標區分正常關閉和異常關閉，
+     * 防止 dc.onclose 把已正確 commit 的檔案刪除 */
+    let endMarkerReceived = false;
 
-    // 序列化寫入佇列：所有 write / close / abort 操作嚴格按順序執行
-    // 這是解決「end marker 在 pending write 完成前抵達」的核心修復
+    // 序列化寫入佇列：所有 write / close / abort 操作嚴格按到達順序執行
     let writeQueue: Promise<void> = Promise.resolve();
 
     return new Promise<void>((resolve, reject) => {
@@ -499,27 +502,28 @@ class WebRTCManager {
       };
 
       dc.onmessage = (e) => {
-        if (settled) return; // 已結束（含失敗），忽略後續訊息
+        if (settled) return;
         const data = e.data as ArrayBuffer;
 
         if (data.byteLength === 0) {
-          // 結束標記：排入佇列尾端，等所有 write 完成後才 close
+          // 結束標記：標記已收到，並排入佇列尾端等所有 write 完成後才 close
+          endMarkerReceived = true;
           writeQueue = writeQueue
             .then(async () => {
               await writer.close();
               settle(() => resolve());
             })
             .catch(async (err) => {
-              // 前面某個 write 已失敗，中止並釋放 .crswap
+              // 前面某個 write 已失敗，中止並清理
               await writer.abort();
               await fileStore.deleteFile(fileId);
               settle(() => reject(err));
             });
         } else {
-          // 資料區塊：排入佇列序列寫入
-          const chunk = new Uint8Array(data.slice(0)); // 複製以免 ArrayBuffer 被回收
+          // 資料區塊：排入佇列序列寫入（slice 複製 ArrayBuffer，避免 GC 回收原始資料）
+          const chunk = new Uint8Array(data.slice(0));
           writeQueue = writeQueue.then(async () => {
-            if (settled) return; // abort 已在進行中，略過此區塊
+            if (settled) return;
             await writer.write(chunk);
             received += chunk.byteLength;
             this.onProgress(fileId, received);
@@ -528,8 +532,8 @@ class WebRTCManager {
       };
 
       dc.onerror = () => {
-        if (settled) return;
-        // 排入佇列尾端，等先前寫入完成（或失敗）後再 abort
+        // 若已收到結束標記（表示傳輸成功，close/settle 正在進行中），忽略後續的 error 事件
+        if (endMarkerReceived || settled) return;
         writeQueue = writeQueue.finally(async () => {
           await writer.abort();
           await fileStore.deleteFile(fileId);
@@ -538,7 +542,9 @@ class WebRTCManager {
       };
 
       dc.onclose = () => {
-        if (settled) return;
+        // 收到 end marker 後 DataChannel 會正常關閉，屬於預期行為，不應視為錯誤
+        // 只有在「未收到 end marker 且尚未 settled」時才代表異常關閉
+        if (endMarkerReceived || settled) return;
         writeQueue = writeQueue.finally(async () => {
           await writer.abort();
           await fileStore.deleteFile(fileId);
