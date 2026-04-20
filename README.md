@@ -1,5 +1,7 @@
 # mesh-file-share
 
+繁體中文 | [English](README.en.md)
+
 mesh-file-share 是一套給區域網路環境使用的大檔案分發工具。
 
 分享端使用 Tauri 桌面應用程式管理檔案與狀態，下載端只要開瀏覽器連線即可下載。
