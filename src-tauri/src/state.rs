@@ -73,6 +73,8 @@ pub struct SignalingMessage {
     pub from_client_id: String,
     pub to_client_id: String,
     pub file_id: String,
+    /// 傳輸通道 ID，對應 RelayAssignEvent.channel_id，防止舊信令汙染新連線
+    pub channel_id: String,
     pub payload: serde_json::Value,
 }
 
@@ -84,6 +86,8 @@ pub struct RelayAssignEvent {
     pub source_client_id: String,
     pub target_client_id: String,
     pub file_size: u64,
+    /// 本次傳輸通道唯一 ID，用於 WebRTC 信令比對，防止舊信令汙染新連線
+    pub channel_id: String,
 }
 
 /// 下載進度事件
@@ -113,6 +117,8 @@ pub struct ConnectedClient {
 pub struct QueueItem {
     pub client_id: String,
     pub state: DownloadState,
+    /// 曾對此端失敗過的中繼來源 client_id（避免重複指派同一失敗配對）
+    pub failed_relays: Vec<String>,
 }
 
 /// 每個檔案的下載佇列

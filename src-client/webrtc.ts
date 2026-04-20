@@ -49,9 +49,10 @@ class WebRTCManager {
 
   /** 作為傳送端：建立連線並傳送檔案 */
   async startSending(event: RelayAssignEvent) {
-    const peerKey = `${event.fileId}-${event.targetClientId}`;
+    // peerKey 使用 channelId，每次 relay-assign 都是唯一 ID，完全避免舊連線信令汙染新連線
+    const peerKey = event.channelId;
 
-    // 清理已存在的同 peerKey 連線（避免重複）
+    // 清理已存在的同名連線（正常不應發生，防御用）
     if (this.connections.has(peerKey)) {
       console.warn("WebRTC 清理既有連線:", peerKey);
       this.cleanup(peerKey);
@@ -79,6 +80,8 @@ class WebRTCManager {
       console.error("WebRTC 連線逾時:", peerKey);
       this.cleanup(peerKey);
       this.notifyTransferFailed(event.fileId, event.targetClientId);
+      // 將 UI 狀態從「分享中」切回「完成」
+      this.onSendComplete(event.fileId);
     }, CONNECTION_TIMEOUT);
 
     dc.onopen = async () => {
@@ -105,6 +108,8 @@ class WebRTCManager {
       clearTimeout(timeout);
       this.cleanup(peerKey);
       this.notifyTransferFailed(event.fileId, event.targetClientId);
+      // 將 UI 狀態從「分享中」切回「完成」
+      this.onSendComplete(event.fileId);
     };
 
     pc.onicecandidate = (e) => {
@@ -114,6 +119,7 @@ class WebRTCManager {
           fromClientId: this.clientId,
           toClientId: event.targetClientId,
           fileId: event.fileId,
+          channelId: event.channelId,
           payload: e.candidate.toJSON(),
         });
       }
@@ -121,6 +127,16 @@ class WebRTCManager {
 
     pc.oniceconnectionstatechange = () => {
       console.log("WebRTC ICE 狀態 (sender):", peerKey, pc.iceConnectionState);
+      if (
+        pc.iceConnectionState === "failed" ||
+        pc.iceConnectionState === "disconnected"
+      ) {
+        console.error("WebRTC ICE 失敗/斷線 (sender):", peerKey);
+        clearTimeout(timeout);
+        this.cleanup(peerKey);
+        this.notifyTransferFailed(event.fileId, event.targetClientId);
+        this.onSendComplete(event.fileId);
+      }
     };
 
     // 建立 SDP offer
@@ -133,6 +149,7 @@ class WebRTCManager {
       fromClientId: this.clientId,
       toClientId: event.targetClientId,
       fileId: event.fileId,
+      channelId: event.channelId,
       payload: pc.localDescription!.toJSON(),
     });
 
@@ -142,9 +159,10 @@ class WebRTCManager {
 
   /** 作為接收端：等待連線並接收檔案 */
   async startReceiving(event: RelayAssignEvent) {
-    const peerKey = `${event.fileId}-${event.sourceClientId}`;
+    // peerKey 使用 channelId，與傳送端一致
+    const peerKey = event.channelId;
 
-    // 清理已存在的同 peerKey 連線
+    // 清理已存在的同名連線
     if (this.connections.has(peerKey)) {
       console.warn("WebRTC 清理既有接收連線:", peerKey);
       this.cleanup(peerKey);
@@ -195,6 +213,7 @@ class WebRTCManager {
           fromClientId: this.clientId,
           toClientId: event.sourceClientId,
           fileId: event.fileId,
+          channelId: event.channelId,
           payload: e.candidate.toJSON(),
         });
       }
@@ -206,6 +225,15 @@ class WebRTCManager {
         peerKey,
         pc.iceConnectionState,
       );
+      if (
+        pc.iceConnectionState === "failed" ||
+        pc.iceConnectionState === "disconnected"
+      ) {
+        console.error("WebRTC ICE 失敗/斷線 (receiver):", peerKey);
+        clearTimeout(timeout);
+        this.cleanup(peerKey);
+        this.notifyTransferFailed(event.fileId, event.targetClientId);
+      }
     };
 
     // 處理在連線建立前暫存的信令
@@ -223,32 +251,18 @@ class WebRTCManager {
 
   /** 處理信令訊息 */
   private async handleSignaling(msg: SignalingMessage) {
-    // 找對應的連線
-    let peerKey: string | undefined;
-    for (const [key, conn] of this.connections) {
-      if (
-        conn.fileId === msg.fileId &&
-        ((conn.role === "sender" &&
-          conn.event.targetClientId === msg.fromClientId) ||
-          (conn.role === "receiver" &&
-            conn.event.sourceClientId === msg.fromClientId))
-      ) {
-        peerKey = key;
-        break;
-      }
-    }
+    // 直接以 channelId 查找對應連線（該 ID 唯一且與本連線和舊連線完全障離）
+    const peerKey = msg.channelId;
+    const conn = this.connections.get(peerKey);
 
-    if (!peerKey) {
+    if (!conn) {
       // 連線尚未建立，暫存信令
-      const bufferKey = `${msg.fileId}-${msg.fromClientId}`;
-      const pending = this.pendingSignaling.get(bufferKey) || [];
+      const pending = this.pendingSignaling.get(peerKey) ?? [];
       pending.push(msg);
-      this.pendingSignaling.set(bufferKey, pending);
-      console.log("WebRTC 暫存信令:", msg.type, bufferKey);
+      this.pendingSignaling.set(peerKey, pending);
+      console.log("WebRTC 暫存信令:", msg.type, peerKey);
       return;
     }
-
-    const conn = this.connections.get(peerKey)!;
 
     if (msg.type === "offer") {
       await conn.pc.setRemoteDescription(
@@ -269,6 +283,7 @@ class WebRTCManager {
         fromClientId: this.clientId,
         toClientId: msg.fromClientId,
         fileId: msg.fileId,
+        channelId: msg.channelId,
         payload: conn.pc.localDescription!.toJSON(),
       });
     } else if (msg.type === "answer") {
@@ -300,25 +315,13 @@ class WebRTCManager {
 
   /** 處理在連線建立前暫存的信令訊息 */
   private flushPendingSignaling(peerKey: string) {
-    // peerKey 可能匹配多種 bufferKey 格式
-    const conn = this.connections.get(peerKey);
-    if (!conn) return;
-
-    for (const [bufferKey, msgs] of this.pendingSignaling) {
-      const matches = msgs.filter(
-        (m) =>
-          m.fileId === conn.fileId &&
-          ((conn.role === "sender" &&
-            conn.event.targetClientId === m.fromClientId) ||
-            (conn.role === "receiver" &&
-              conn.event.sourceClientId === m.fromClientId)),
-      );
-      if (matches.length > 0) {
-        console.log("WebRTC 套用暫存信令:", bufferKey, matches.length, "筆");
-        this.pendingSignaling.delete(bufferKey);
-        for (const m of matches) {
-          this.queueHandleSignaling(m);
-        }
+    // 現在以 channelId 為 key，可直接查找
+    const pending = this.pendingSignaling.get(peerKey);
+    if (pending?.length) {
+      console.log("WebRTC 套用暫存信令:", peerKey, pending.length, "筆");
+      this.pendingSignaling.delete(peerKey);
+      for (const m of pending) {
+        this.queueHandleSignaling(m);
       }
     }
   }
@@ -465,6 +468,8 @@ class WebRTCManager {
       conn.dc?.close();
       conn.pc.close();
       this.connections.delete(peerKey);
+      // 清除此連線的暫存信令，防止舊信令汹入後續連線
+      this.pendingSignaling.delete(peerKey);
     }
   }
 }

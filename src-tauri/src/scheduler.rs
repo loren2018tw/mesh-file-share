@@ -30,6 +30,7 @@ impl AppState {
         queue.items.push(QueueItem {
             client_id: client_id.to_string(),
             state: DownloadState::Queued,
+            failed_relays: Vec::new(),
         });
 
         let event = ScheduleEvent {
@@ -115,49 +116,104 @@ impl AppState {
                     && ch.target == target_client_id)
             });
         }
+        // 廣播中繼來源端切回「下載完成」（server 端同步，確保 UI 一致）
+        self.broadcast(SseEvent {
+            event_type: "schedule-update".to_string(),
+            data: serde_json::to_value(&ScheduleEvent {
+                file_id: file_id.to_string(),
+                client_id: source_client_id.to_string(),
+                state: DownloadState::Completed,
+                queue_position: None,
+            })
+            .unwrap(),
+        });
         self.mark_download_complete(file_id, target_client_id).await;
     }
 
     /// 傳輸失敗：回退為排隊中，觸發排程
     pub async fn mark_transfer_failed(&self, file_id: &str, client_id: &str) {
-        // 如果失敗的是中繼目標端，也釋放中繼來源端
+        // 防護：只處理目標端目前為 Downloading 的情況
+        // （避免 sender/receiver 同時回報導致雙重處理，或誤重置已重新分配的狀態）
         {
-            let mut release_relay: Option<String> = None;
-            {
-                let channels = self.channels.read().await;
-                for ch in channels.values() {
-                    if ch.file_id == file_id
-                        && ch.target == client_id
-                        && ch.channel_type == ChannelType::Webrtc
-                    {
-                        release_relay = Some(ch.source.clone());
-                        break;
-                    }
-                }
+            let queues = self.queues.read().await;
+            let is_downloading = queues
+                .get(file_id)
+                .and_then(|q| q.items.iter().find(|i| i.client_id == client_id))
+                .map(|item| item.state == DownloadState::Downloading)
+                .unwrap_or(false);
+            if !is_downloading {
+                return;
             }
-            if let Some(relay_id) = release_relay {
-                let mut clients = self.clients.write().await;
-                if let Some(relay) = clients.get_mut(&relay_id) {
-                    relay.is_relaying = false;
+        }
+
+        // 如果失敗的是中繼目標端，找出中繼來源端
+        let mut release_relay: Option<String> = None;
+        {
+            let channels = self.channels.read().await;
+            for ch in channels.values() {
+                if ch.file_id == file_id
+                    && ch.target == client_id
+                    && ch.channel_type == ChannelType::Webrtc
+                {
+                    release_relay = Some(ch.source.clone());
+                    break;
                 }
             }
         }
 
-        // 清理相關通道
+        // 釋放中繼來源端
+        if let Some(relay_id) = &release_relay {
+            {
+                let mut clients = self.clients.write().await;
+                if let Some(relay) = clients.get_mut(relay_id.as_str()) {
+                    relay.is_relaying = false;
+                }
+            }
+            // 通知中繼來源端切回「下載完成」狀態
+            self.broadcast(SseEvent {
+                event_type: "schedule-update".to_string(),
+                data: serde_json::to_value(&ScheduleEvent {
+                    file_id: file_id.to_string(),
+                    client_id: relay_id.clone(),
+                    state: DownloadState::Completed,
+                    queue_position: None,
+                })
+                .unwrap(),
+            });
+        }
+
+        // 清理相關傳輸通道
         {
             let mut channels = self.channels.write().await;
             channels.retain(|_, ch| !(ch.file_id == file_id && ch.target == client_id));
         }
 
-        // 回退為排隊中
+        // 回退為排隊中，並記錄失敗的中繼來源（避免重複指派相同失敗配對）
         {
             let mut queues = self.queues.write().await;
             if let Some(queue) = queues.get_mut(file_id) {
                 if let Some(item) = queue.items.iter_mut().find(|i| i.client_id == client_id) {
                     item.state = DownloadState::Queued;
+                    if let Some(relay_id) = &release_relay {
+                        if !item.failed_relays.contains(relay_id) {
+                            item.failed_relays.push(relay_id.clone());
+                        }
+                    }
                 }
             }
         }
+
+        // 立即廣播目標端回到排隊中（讓客戶端 UI 即時更新，確保下次 HTTP 分配時狀態正確）
+        self.broadcast(SseEvent {
+            event_type: "schedule-update".to_string(),
+            data: serde_json::to_value(&ScheduleEvent {
+                file_id: file_id.to_string(),
+                client_id: client_id.to_string(),
+                state: DownloadState::Queued,
+                queue_position: None,
+            })
+            .unwrap(),
+        });
 
         self.dispatch_all().await;
     }
@@ -256,7 +312,22 @@ impl AppState {
             drop(clients);
 
             for target_id in remaining {
-                if let Some(relay_id) = available_relays.pop() {
+                // 取得此目標端的失敗中繼清單，跳過曾失敗的配對
+                let failed_relays: Vec<String> = queue
+                    .items
+                    .iter()
+                    .find(|i| i.client_id == target_id)
+                    .map(|i| i.failed_relays.clone())
+                    .unwrap_or_default();
+
+                // 找第一個不在失敗清單中的中繼端
+                let relay_pos = available_relays
+                    .iter()
+                    .rposition(|r| !failed_relays.contains(r));
+
+                if let Some(pos) = relay_pos {
+                    let relay_id = available_relays.remove(pos);
+
                     if let Some(item) = queue.items.iter_mut().find(|i| i.client_id == target_id) {
                         item.state = DownloadState::Downloading;
                     }
@@ -276,11 +347,16 @@ impl AppState {
                         target: target_id.clone(),
                         channel_type: ChannelType::Webrtc,
                     };
+                    let channel_id = channel.channel_id.clone();
                     self.channels
                         .write()
                         .await
                         .insert(channel.channel_id.clone(), channel);
 
+                    // 傳送 relay-assign（含 channel_id，用於 WebRTC 信令比對）
+                    // 注意：不另外廣播 schedule-update(downloading) 給接收端；
+                    // 接收端透過 relay-assign 已知要開始 WebRTC 下載。
+                    // 額外的 schedule-update 會使接收端在 WebRTC 失敗重試後誤啟動 HTTP 下載。
                     self.broadcast(SseEvent {
                         event_type: "relay-assign".to_string(),
                         data: serde_json::to_value(&RelayAssignEvent {
@@ -288,23 +364,18 @@ impl AppState {
                             source_client_id: relay_id.clone(),
                             target_client_id: target_id.clone(),
                             file_size: file.size,
-                        })
-                        .unwrap(),
-                    });
-
-                    self.broadcast(SseEvent {
-                        event_type: "schedule-update".to_string(),
-                        data: serde_json::to_value(&ScheduleEvent {
-                            file_id: file_id.to_string(),
-                            client_id: target_id.clone(),
-                            state: DownloadState::Downloading,
-                            queue_position: None,
+                            channel_id: channel_id.clone(),
                         })
                         .unwrap(),
                     });
 
                     assigned.push(target_id);
                 } else {
+                    // 所有可用中繼端皆曾失敗於此目標端 → 清除失敗記錄讓下次重新嘗試
+                    // （避免永久卡住；若網路問題已恢復，下一輪 dispatch 可再試）
+                    if let Some(item) = queue.items.iter_mut().find(|i| i.client_id == target_id) {
+                        item.failed_relays.clear();
+                    }
                     break;
                 }
             }

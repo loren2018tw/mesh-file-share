@@ -55,6 +55,8 @@ export interface SignalingMessage {
   fromClientId: string;
   toClientId: string;
   fileId: string;
+  /** 對應 RelayAssignEvent.channelId，用於比對信令所屬的連線，過濾舊連線的殘留信令 */
+  channelId: string;
   payload: RTCSessionDescriptionInit | RTCIceCandidateInit;
 }
 
@@ -67,6 +69,8 @@ export interface RelayAssignEvent {
   targetClientId: string;
   /** 檔案大小 */
   fileSize: number;
+  /** 本次傳輸通道唯一 ID，用於 WebRTC 信令比對，防止舊信令汙染新連線 */
+  channelId: string;
 }
 
 /** 下載進度事件 */

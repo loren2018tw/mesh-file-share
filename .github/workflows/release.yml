@@ -58,15 +58,11 @@ jobs:
           echo "DATE=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
           echo "VERSION=$(date +'%y.%-m.%-d')" >> $GITHUB_OUTPUT
 
-      - name: set version and asset pattern
+      - name: set version
         shell: bash
         run: |
-          DATE=${{ steps.date.outputs.DATE }}
           VERSION=${{ steps.date.outputs.VERSION }}
-          # Update version
           sed -i "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" src-tauri/tauri.conf.json
-
-          echo "ASSET_PATTERN=mesh-file-share_${DATE}_[arch][ext]" >> $GITHUB_ENV
 
       - name: Build and release
         uses: tauri-apps/tauri-action@v0
@@ -77,31 +73,4 @@ jobs:
           releaseName: "Release v${{ steps.date.outputs.DATE }}"
           releaseDraft: true
           prerelease: false
-          assetNamePattern: ${{ env.ASSET_PATTERN }}
           args: ${{ matrix.args }}
-
-      - name: Create portable archive (Linux)
-        if: matrix.platform == 'ubuntu-22.04'
-        shell: bash
-        run: |
-          DATE=${{ steps.date.outputs.DATE }}
-          cd src-tauri/target/release
-          tar -czf "mesh-file-share_${DATE}_amd64-portable.tar.gz" mesh-file-share
-
-      - name: Create portable archive (Windows)
-        if: matrix.platform == 'windows-latest'
-        shell: bash
-        run: |
-          DATE=${{ steps.date.outputs.DATE }}
-          cd src-tauri/target/release
-          7z a "mesh-file-share_${DATE}_x64-portable.zip" mesh-file-share.exe
-
-      - name: Upload portable archive
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ steps.date.outputs.DATE }}
-          draft: true
-          files: |
-            src-tauri/target/release/mesh-file-share_*-portable.*
