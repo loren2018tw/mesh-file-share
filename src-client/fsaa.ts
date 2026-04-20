@@ -73,7 +73,10 @@ class FileStoreManager {
         await writable.write({
           type: "write",
           position: offset,
-          data: chunk,
+          data: chunk.buffer.slice(
+            chunk.byteOffset,
+            chunk.byteOffset + chunk.byteLength,
+          ) as ArrayBuffer,
         });
         offset += chunk.byteLength;
         writtenSizes.set(fileId, offset);
