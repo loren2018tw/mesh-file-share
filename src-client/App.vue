@@ -276,19 +276,23 @@ async function startHttpDownload(fileId: string) {
       downloadedBytes: file.size,
     });
 
-    // 通知伺服器完成
-    await fetch(`/api/files/${fileId}/complete`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientId: clientId.value }),
-    });
+    // 通知伺服器完成（包装 try/catch：fetch 失敗不應將已存兒磁碟的檔案刪除）
+    try {
+      await fetch(`/api/files/${fileId}/complete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientId: clientId.value }),
+      });
 
-    // 註冊為中繼端
-    await fetch("/api/relay/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientId: clientId.value, fileId }),
-    });
+      // 註冊為中繼端
+      await fetch("/api/relay/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientId: clientId.value, fileId }),
+      });
+    } catch (regErr) {
+      console.error("完成回報失敗（檔案已儲存）:", fileId, regErr);
+    }
   } catch (err) {
     console.error("下載失敗:", err);
     // 通知伺服器失敗
@@ -332,18 +336,23 @@ async function handleRelayReceiveComplete(fileId: string) {
     downloadedBytes: file.size,
   });
 
-  // 通知伺服器中繼完成
-  await fetch(`/api/files/${fileId}/complete`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ clientId: clientId.value }),
-  });
+  // 通知伺服器中繼完成（包装 try/catch：fetch 失敗不應將已存兒磁碟的檔案刪除）
+  try {
+    await fetch(`/api/files/${fileId}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientId: clientId.value }),
+    });
 
-  await fetch("/api/relay/register", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ clientId: clientId.value, fileId }),
-  });
+    await fetch("/api/relay/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientId: clientId.value, fileId }),
+    });
+  } catch (regErr) {
+    // 就算回報失敗，檔案已對，不影響建存檔案本身；記錄附加就好
+    console.error("中繼完成回報失敗（檔案已儲存）:", fileId, regErr);
+  }
 }
 
 // --- Download Request ---

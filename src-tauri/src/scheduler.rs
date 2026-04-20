@@ -131,7 +131,15 @@ impl AppState {
             })
             .unwrap(),
         });
-        self.mark_download_complete(file_id, target_client_id).await;
+
+        // *** 不在此呼叫 mark_download_complete(target) ***
+        // 傳送端說「我傳完了」≠ 接收端已成功驗證並寫入磁碟。
+        // 接收端完成後會主動呼叫 /api/files/:id/complete，由接收端自己觸發 mark_download_complete。
+        // 若在此提前標記接收端完成，接收端 writer.close() 失敗時無法透過 transfer-failed 退回排隊，
+        // 導致接收端沒有檔案卻被排程為 relay source。
+        //
+        // 這裡只需釋放 relay source，並觸發排程讓 source 可再次被使用或讓下一個排隊者繼續。
+        self.dispatch_all().await;
     }
 
     /// 傳輸失敗：回退為排隊中，觸發排程

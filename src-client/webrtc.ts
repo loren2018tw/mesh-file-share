@@ -245,14 +245,27 @@ class WebRTCManager {
       }
       const dc = e.channel;
 
+      // 用來區分「receiveFile 失敗」和「onReceiveComplete 失敗」兩種情況
+      let fileWrittenSuccessfully = false;
       try {
         console.log("WebRTC DataChannel 已接收，開始接收檔案:", peerKey);
         await this.receiveFile(dc, event.fileId, event.fileSize);
+        // 走到此處代表檔案已寫入磁碟，writer.close() 已完成
+        fileWrittenSuccessfully = true;
         await this.onReceiveComplete(event.fileId);
       } catch (err) {
-        console.error("WebRTC 接收失敗:", err);
-        await fileStore.deleteFile(event.fileId);
-        await this.notifyTransferFailed(event.fileId, event.targetClientId);
+        if (!fileWrittenSuccessfully) {
+          // receiveFile 本身失敗：檔案不完整，清理並通知伺服器回退排隊
+          console.error("WebRTC 接收失敗（寫入階段）:", err);
+          await fileStore.deleteFile(event.fileId);
+          await this.notifyTransferFailed(event.fileId, event.targetClientId);
+        } else {
+          // receiveFile 成功（檔案已寫入磁碟），但 onReceiveComplete 回報失敗
+          // 不刪除檔案！檔案是完整的。
+          // 伺服器端尚未標記完成，呼叫 transfer-failed 讓排程退回
+          console.error("WebRTC 接收後回報失敗（檔案已儲存，勿刪）:", err);
+          await this.notifyTransferFailed(event.fileId, event.targetClientId);
+        }
       } finally {
         this.cleanup(peerKey);
       }
